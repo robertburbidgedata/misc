@@ -1,0 +1,364 @@
+# Sample code for an eCommerce recommendation engine
+#
+# Robert Burbidge
+# robertburbidgedata@yahoo.co.uk
+# 07429752941
+# Mon 30-Apr-18
+
+# Python 3.6.5
+
+import pandas as pd
+import numpy as np
+import os
+import scipy
+from scipy.sparse import coo_matrix
+from scipy.sparse import csr_matrix
+from lightfm import LightFM
+from lightfm.evaluation import precision_at_k
+# from lightfm.evaluation import auc_score
+import seaborn as sns
+sns.set(color_codes=True)
+
+path = "/home/robertburbidge/Documents/CV/python/"
+
+# Part I
+#
+# Data
+# transactions.tsv
+# Dataset of in-store customer transactions. Each transaction would consist of a
+# number of items. The transaction value is the total cost of the items in the
+# basket.
+# Columns:
+#   transaction.value – Value of the basket in £’s
+#   gender – The gender of the customer
+#   store.type – The type of store the transaction occurred in
+
+# Check datafile.
+dfile = "transactions.tsv"
+filename = '"' + path + "/" + dfile + '"'
+
+os.system("head " + filename)
+# transaction.value	gender	store.type
+# 33.8	Male	Metro
+# 7.02	Male	Superstore
+# 335.88	Female	Extra
+# 79.02	Male	Superstore
+# 354.15	Male	Metro
+# 1414.49	Male	Superstore
+# 16.89	Female	Express
+# 201.22	Female	Superstore
+# 29.49	Female	Metro
+
+os.system("head -2 " + filename + "|od -c")
+# tab-separated
+
+os.system("wc " + filename)
+# 2000 records, no missing entries
+
+os.system("tail -n+2 " + filename + "|cut -f1|sort -gu")
+# transaction.value: 0.46 .. 150032 (one value is %g)
+# two or three suspect values: possibly data entry/processing/formatting errors, different currency, etc.
+
+os.system("tail -n+2 " + filename + "|cut -f2|sort -u")
+# gender: Female, Male
+
+os.system("tail -n+2 " + filename + "|cut -f3|sort -u")
+# store.type: Express, Extra, Metro, Superstore
+
+# datafile looks good, so import
+datadf = pd.read_csv(path + "/" + dfile, delimiter='\t')
+print(datadf.head())
+
+# Q1) What is the average transaction value?
+
+# View data distribution to see what kind of average would be most informative.
+sns.distplot(np.log10(datadf["transaction.value"]), axlabel="log10(transaction.value)")
+# Figure_1.png
+# Looks like a mixture of four Gaussians.
+
+# Values over 1e4 are probably spurious, delete these.
+datadf = datadf.loc[datadf["transaction.value"] < 1e4]
+
+# View data distribution to see what kind of average would be most informative.
+sns.distplot(datadf["transaction.value"], axlabel="transaction.value")
+# Figure_2.png
+
+# mean±se
+print(np.round(np.mean(datadf["transaction.value"]),2))
+print(np.round(np.std(datadf["transaction.value"],ddof=1)/np.sqrt(datadf.shape[0]),2))
+# 155.47±5.89
+
+# Since the distribution is skewed, we could report the median, depending on what the "average"
+# was to be used for. However, since the distribution is highly non-normal, estimadatadfting the
+# standard error of the median would be difficult.
+
+# The distribution is multi-modal (four local maxima in histogram), so reporting the global
+# mode would be misleading.
+
+# Q2) Is there significant difference between spend in different store types?
+
+# use for one-sided significance tests
+p = 0.05
+
+# critical value (don't need Student's t as n >> 50 for all groups)
+zcrit = scipy.stats.norm.ppf(1-p)
+
+# group by store.type, calculate mean transaction.value, and order store.type by the means
+datadfg = datadf.groupby("store.type")
+datadfgm = datadfg["transaction.value"].mean()
+storeTypes = [list(datadfg.groups.keys())[i] for i in datadfgm.values.argsort()]
+
+# se's
+datadfgse = datadfg["transaction.value"].std(ddof=1)/np.sqrt(datadfg.size())
+
+# z-statistics
+print(np.array([(datadfgm[storeTypes[sTi]] - datadfgm[storeTypes[sTi-1]]) /
+      np.sqrt(datadfgse[storeTypes[sTi]]**2 + datadfgse[storeTypes[sTi-1]]**2) for sTi in range(1, len(datadfg))])
+      > zcrit)
+
+# with 95% confidence, there is significant difference in spend in different store types
+
+# Part II
+#
+# Data
+# content_train.tsv
+# content_test.tsv
+#
+# Our aim is to show the most relevant cards to the customer.
+#
+# Q3) Create a model to predict if a user will click on 1st marketing
+# content (e.g. content_1). How well does it perform?
+#
+# For this question, you should only be using the data in content_train.tsv.
+#
+# It is up to you how to measure performance, but you should be prepared to
+# justify why you choose a particular performance measure.
+
+# Check datafile.
+trainfile = "content_train.tsv"
+filenametrn = '"' + path + "/" + trainfile + '"'
+
+os.system("head -1 " + filenametrn + "| tr '\t' '\n'")
+# customer.id
+# content_1
+# content_2
+# content_3
+# content_4
+# content_5
+# content_6
+# content_7
+# content_8
+# content_9
+# express.no.transactions
+# express.total.spend
+# metro.no.transactions
+# metro.total.spend
+# superstore.no.transactions
+# superstore.total.spend
+# extra.no.transactions
+# extra.total.spend
+# fandf.no.transactions
+# fandf.total.spend
+# petrol.no.transactions
+# petrol.total.spend
+# direct.no.transactions
+# direct.total.spend
+# gender
+# affluency
+# county
+
+os.system("tail +2 " + filenametrn + "|head")
+# 1	NA	NA	NA	NA	NA	NA	0	0	NA	44	984.54	64	2121.46	21	78.56	39	634.11	14	76.12	32	753.12	10	617.47	Female	Mid	Surrey
+# 2	NA	NA	NA	0	NA	0	NA	NA	0	49	514.98	79	56.28	39	2824.11	52	679.78	13	142.74	28	37.86	51	2787.49	Female	Mid	Greater Manchester
+# 3	0	NA	0	NA	NA	0	NA	0	0	44	66.96	68	1766.38	50	2609.1	78	282.9	7	672.12	55	563.12	4	444.34	Female	Low	Greater Manchester
+# 4	NA	0	NA	0	NA	0	NA	NA	0	29	1425.38	49	689.62	53	945.63	81	5954.89	49	2394.1	56	912.7	24	5859.31	Male	Mid	Brighton & Hove
+# 5	0	NA	NA	0	0	0	0	NA	NA	38	143.67	39	601.6	39	856.57	52	3170.4	27	651.36	52	925.3	17	433.57	Female	Low	Norfolk
+# 6	0	0	NA	NA	NA	0	NA	0	0	28	367.26	57	130.24	29	671.6	18	204.8	63	1847.33	45	184.21	26	1461.01	Male	Very Low	West Yorkshire
+# 7	NA	NA	0	NA	NA	NA	NA	0	NA	28	430.83	79	2408.9	58	681.3	36	446.43	16	220.39	3	181.85	38	9904.18	Female	High	Merseyside
+# 8	0	NA	NA	0	NA	NA	NA	NA	NA	47	186.19	82	263.43	56	274.2	87	14829.6	18	2173.71	25	376.18	58	12781.38	Male	High	Tyne and Wear
+# 9	NA	NA	NA	0	NA	0	0	NA	NA	61	76.82	67	1289.17	67	540.27	19	55.64	64	2314.87	35	4.95	43	994.63	Female	Low	South Yorkshire
+# 10	0	NA	NA	0	0	NA	NA	NA	NA	56	1947.77	45	2460.47	51	9436.17	33	573.02	0	0	0	0	32	3342.85	Female	Very High	County Durham
+
+os.system("head -2 " + filenametrn + "|od -c")
+# tab-separated
+
+os.system("wc " + filenametrn)
+# 100000 records, no missing entries
+# (to be clear, we do not consider NA to be missing, missing would be "\t\t")
+
+# datafile looks good, so import
+datadf = pd.read_csv(path + "/" + trainfile, delimiter='\t')
+print(datadf.head())
+n = datadf.shape[0]
+d = 9
+
+# Possible approaches:
+#   multiple hot-deck imputation on content_*
+#   binary classification from *transactions, *spend, gender, affluency, county to content_1
+#   LiteFM for hybrid content-based--collaborative-filtering recommendation engine -> we use this method
+
+# this code has not been optimized
+
+
+# https://stackoverflow.com/questions/16511879/reshape-sparse-matrix-efficiently-python-scipy-0-12
+def reshape(a, shape):
+    """Reshape the sparse matrix `a`.
+
+    Returns a coo_matrix with shape `shape`.
+    """
+    if not hasattr(shape, '__len__') or len(shape) != 2:
+        raise ValueError('`shape` must be a sequence of two integers')
+
+    c = a.tocoo()
+    nrows, ncols = c.shape
+    size = nrows * ncols
+
+    new_size =  shape[0] * shape[1]
+    if new_size != size:
+        raise ValueError('total size of new array must be unchanged')
+
+    flat_indices = ncols * c.row + c.col
+    new_row, new_col = divmod(flat_indices, shape[1])
+
+    b = coo_matrix((c.data, (new_row, new_col)), shape=shape)
+    return b
+
+
+# interactions (0, NA, 1) -> (-1, 0, +1)
+intdf = datadf[["content_" + str(i) for i in np.arange(1,d + 1)]]
+intdf = (intdf * 2 - 1).fillna(0)
+intcoo = reshape(coo_matrix(scipy.matrix(intdf, dtype="float32")), [n*d, 1])
+
+# numeric user features
+# (NB. we are assuming here that we have the user features for all users, it is only the
+#  missing interactions that we don't have)
+# (we also note that content_test.tsv has only a proper subset of the features in content_train.tsv,
+#  so it may be necessary to subset the training columns accordingly in application)
+userfeatdf = datadf.drop(["content_" + str(i) for i in np.arange(1,d + 1)], axis=1)
+userfeatdf.drop(["gender", "affluency", "county"], axis=1, inplace=True)
+userfeatcsr = csr_matrix(scipy.matrix(userfeatdf, dtype="float32"))
+
+# categorical user features
+# we could one-hot-encode gender, affluency, and county ...
+
+# train/val/test split
+ptrain = 0.5
+pval = 0.3
+
+ntrain = int(np.floor(n*ptrain)*d)
+nval = int(np.floor(n*pval)*d)
+
+# uniformly at random sample entries without replacement
+# (we could sample from non-missing entries {-1,+1}, but the datasets
+#  are large enough that random variations in the no. of non-missing
+#  will be negligible with this approach)
+# (NB. this sampling assumes that we are only making predictions for
+#  customers we have already seen; although some of them will be all NAs)
+# (the inclusion of user features in the hybrid model would allow us to
+#  make better-than-chance recommendations of content cards for users
+#  for which we have transaction, etc., data)
+# (the best we can do for totally new customers is to recommend the most
+#  popular content cards; this is not investigated here)
+# (NB. it should be noted that LightFM allows the use of item features,
+#  i.e., we could include characteristics of the content cards if such
+#  were available)
+idx = np.random.choice(n*d, n*d, replace=False)
+idxtrain = idx[:ntrain]
+idxval = idx[ntrain:ntrain+nval]
+idxtest = idx[ntrain+nval:]
+
+# training interactions
+trainintmat = intcoo.todense()
+trainintmat[idxval] = 0.0
+trainintmat[idxtest] = 0.0
+trainintcoo = reshape(coo_matrix(trainintmat), [n, d])
+
+# sample weights (since +ve interactions are very rare)
+wgt = sum((trainintmat < 0).astype("int")) / sum((trainintmat > 0).astype("int"))
+trainwgtmat = trainintmat
+trainwgtmat[trainintmat < 0] = 1
+trainwgtmat[trainintmat > 0] = np.asscalar(wgt)
+trainwgtcoo = reshape(coo_matrix(trainwgtmat), [n, d])
+
+# val interactions
+valintmat = intcoo.todense()
+valintmat[idxtrain] = 0.0
+valintmat[idxtest] = 0.0
+ppval = np.asscalar(sum((valintmat > 0).astype("int")) /
+                              (sum((valintmat > 0).astype("int"))+sum((valintmat < 0).astype("int"))))
+valintcoo = reshape(coo_matrix(valintmat), [n, d])
+
+# hyperparameter grid search using val performance
+# (it is sometimes useful to check val performance incrementally and stop early
+#  as a form of regularization, but these are usually marginal gains; default epochs is 30)
+# (NB. there is a dearth of literature on heuristics for MF and SGD, research reqd ...)
+max_epochs = 100
+no_components = (2**np.arange(1, 10)).astype("int")
+nnc = len(no_components)
+learning_schedule = 'adagrad'
+learning_rate = np.arange(0.01, 0.10, 0.02)    # for adagrad (not adadelta)
+nlr = len(learning_rate)
+# val_auc = np.full([nnc, nlr], np.nan)
+val_lift = np.full([nnc, nlr], np.nan)
+
+for nci in range(nnc):
+    for lri in range(nlr):
+        # define model
+        model = LightFM(no_components=no_components[nci]
+                        , learning_schedule=learning_schedule
+                        , loss='logistic'
+                        , learning_rate=learning_rate[lri])
+
+        # train model
+        model.fit(trainintcoo, sample_weight=trainwgtcoo, user_features=userfeatcsr, epochs=max_epochs, num_threads=6
+                  , verbose=False)
+
+        # val performance (I): use AUC, which is the prob that a randomly chosen +ve example
+        # is ranked higher that a randomly chosen -ve example, i.e., the probability for
+        # each customer that we deliver relevant content instead of irrelevant content
+        # averaged over all customers; interactions in the training set and validation set are excluded
+        # (although by construction these don't exist in this case, they may in other cases)
+        # val_auc[nci, lri] = pd.Series(auc_score(model, valintcoo, trainintcoo)).dropna().mean()
+
+        # val performance (II): since the relative frequency of +ve interactions is so low,
+        # the lift is a more appropriate measure, the precision at k is the proportion of
+        # +ve interactions in the top-ranked k content cards for each customer;
+        # when k=1 this is the (estimated) probability that the top-ranked content card will be
+        # clicked on by the customer;
+        # the lift is the ratio of this to the (estimated) probability that a content card
+        # chosen at random will be clicked on the customer; i.e., it is the factor increase
+        # in the number of +ve interactions from using the recommendation model compared to
+        # randomly serving content cards
+        #
+        # (we don't need dropna() here since preserve_rows is False by default, but just in case)
+        val_lift[nci, lri] = (pd.Series(precision_at_k(model, valintcoo, k=1
+                                                       , user_features=userfeatcsr)).dropna().mean() / ppval)
+
+        # report end of run lift for monitoring
+        print("%d\t%.2f\t%.2f" % (no_components[nci], learning_rate[lri], val_lift[nci, lri]))
+
+# report optimal performance hyperparameters on validation set
+inds = np.unravel_index(np.argmax(val_lift),val_lift.shape)
+nc_opt = no_components[inds[0]]
+lr_opt = learning_rate[inds[1]]
+print("Optimal No. Components: %d" % nc_opt)
+print("Optimal Learning Rate: %.2f" % lr_opt)
+print("Validation performance: %.2f" % val_lift[inds])
+
+# test interactions & performance
+# (NB. although it is tempting to retrain on train+val sets using optimized hyperparameters
+#  here, this is not theoretically sound and in practice can lead to mis-estimation of
+#  performance in production)
+# (However, if the test performance is acceptable, then it is admissable, and advisable, to
+#  reoptimize the hyperparameters by training on train+val, using test as the validation set)
+testintmat = intcoo.todense()
+testintmat[idxtrain] = 0.0
+testintmat[idxval] = 0.0
+pptest = np.asscalar(sum((testintmat > 0).astype("int")) /
+                              (sum((testintmat > 0).astype("int"))+sum((testintmat < 0).astype("int"))))
+testintcoo = reshape(coo_matrix(testintmat), [n, d])
+test_lift = (pd.Series(precision_at_k(model, testintcoo, k=1
+                                               , user_features=userfeatcsr)).dropna().mean() / pptest)
+print("Test lift: %.2f" % test_lift)
+
+# evidence of overfitting, but we're usefully better than random ...
